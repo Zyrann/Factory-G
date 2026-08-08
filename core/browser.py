@@ -111,7 +111,6 @@ class BrowserManager:
         if self.headless:
             # Invisible full Chrome — passes 6/6 stealth
             launch_args = [
-                "--headless=new",
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
@@ -124,6 +123,8 @@ class BrowserManager:
                 "--disable-infobars",
                 "--window-size=1920,1080",
             ]
+            # headless flag (Playwright new mode) only when running headless
+            launch_args.append("--headless=new")
         else:
             # Visible window — minimal args so window actually appears on screen
             launch_args = [
@@ -134,7 +135,7 @@ class BrowserManager:
             ]
 
         browser: Browser = await playwright.chromium.launch(
-            headless=False,
+            headless=self.headless,
             slow_mo=self.slow_mo,
             args=launch_args,
             proxy=active_proxy,
@@ -173,12 +174,21 @@ class BrowserManager:
         return page
 
     async def human_type(self, page: Page, selector: str, text: str):
+        # Best-effort: wait for selector before clicking/typing
+        try:
+            await page.wait_for_selector(selector, timeout=4000)
+        except Exception:
+            pass
         await page.click(selector)
         for char in text:
             await page.type(selector, char, delay=self.typing_delay + random.randint(-15, 30))
             
     async def human_click(self, page: Page, selector: str):
         await asyncio.sleep(random.uniform(0.2, 0.6))
+        try:
+            await page.wait_for_selector(selector, timeout=3000)
+        except Exception:
+            pass
         await page.click(selector)
 
     async def wait_random(self, min_ms: int = 500, max_ms: int = 1800):

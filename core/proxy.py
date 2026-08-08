@@ -10,7 +10,7 @@ logger = logging.getLogger("proxy")
 #
 # OkkProxy (default, cheapest at $0.5/GB):
 #   Host: un-residential.okkproxy.com  Port: 16666
-#   Username: {user}-country-{cc}-session-{id}  → sticky
+#   Username: {user}-country-{cc}-sessid-{id}  → sticky  (standardized to -sessid-)
 #   Username: {user}-country-{cc}               → rotating
 #
 # Webshare ($7/GB):
@@ -50,7 +50,8 @@ class ProxyManager:
         self._active_sessions[session_id] = time.time()
 
         if self.provider == "okkproxy":
-            user = f"{self.okk_user}-country-{cc}-session-{session_id}"
+            # STANDARDIZED: use -sessid- token so rotation helpers can find it
+            user = f"{self.okk_user}-country-{cc}-sessid-{session_id}"
             logger.debug(f"OkkProxy session [{cc}]: {session_id}")
             return {
                 "session_id": session_id, "country": cc, "provider": "okkproxy",
