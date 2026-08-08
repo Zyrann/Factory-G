@@ -5,59 +5,31 @@ from rebrowser_playwright.async_api import Page, TimeoutError as PlaywrightTimeo
 
 logger = logging.getLogger("gmail_factory")
 
-class SMSPoolClient:
-    """Wrapper for SMSPool API enforcing strict on-demand service parameters."""
-    
-    def __init__(self, api_key: str, default_country: int = 8):  # 8 = Indonesia
-        self.api_key = api_key
-        self.default_country = default_country
-        # 373 is SMSPool's official numeric Service ID for Google / Gmail
-        self.GOOGLE_SERVICE_ID = "google"
-
-    async def buy_number(self, session, country: Optional[int] = None) -> Optional[Dict[str, Any]]:
-        target_country = country or self.default_country
-        url = "https://api.smspool.net/purchase/sms"
-        
-        # Explicitly passing service ID '373' as a string to prevent 'Invalid service' errors
-        params = {
-            "key": self.api_key,
-            "country": str(target_country),
-            "service": self.GOOGLE_SERVICE_ID
-        }
-
-        try:
-            async with session.post(url, data=params) as resp:
-                data = await resp.json(content_type=None)
-                if data.get("success") == 1:
-                    logger.info(f"SMSPool: Bought number +{data.get('phonenumber')} (Order: {data.get('order_id')})")
-                    return {
-                        "order_id": data.get("order_id"),
-                        "number": data.get("phonenumber"),
-                        "cc": data.get("cc")
-                    }
-                else:
-                    logger.error(f"SMSPool API Error: {data}")
-                    return None
-        except Exception as e:
-            logger.error(f"Failed to connect to SMSPool: {e}")
-            return None
-
-    async def cancel_order(self, session, order_id: str) -> bool:
-        url = "https://api.smspool.net/sms/cancel"
-        params = {"key": self.api_key, "orderid": order_id}
-        try:
-            async with session.post(url, data=params) as resp:
-                data = await resp.json(content_type=None)
-                return data.get("success") == 1
-        except Exception:
-            return False
-
+# GmailFactory expects a smspool-like client with:
+# - buy_number(session, country=None) -> dict or None
+# - poll_sms(session, order_id) -> str or None
+# - cancel_order(session, order_id) -> bool
+#
+# The core.smspool.SMSPool provided in this repo matches that interface.
 
 class GmailFactory:
-    def __init__(self, browser_mgr, smspool_client: SMSPoolClient, cfg: Dict[str, Any]):
+    def __init__(self, browser_mgr, smspool_client=None, cfg: Optional[Dict[str, Any]] = None):
+        """
+        browser_mgr: BrowserManager instance
+        smspool_client: optional SMSPool-like client. If None, this class will attempt to import and construct one from core.smspool using cfg.
+        cfg: configuration dict
+        """
         self.browser_mgr = browser_mgr
         self.smspool = smspool_client
-        self.cfg = cfg
+        self.cfg = cfg or {}
+
+        if self.smspool is None:
+            try:
+                from core.smspool import SMSPool
+                self.smspool = SMSPool(api_key=self.cfg.get("api_keys", {}).get("smspool", ""), cfg=self.cfg.get("smspool", {}))
+            except Exception:
+                logger.warning("No SMSPool client available; phone verification will fail if requested")
+                self.smspool = None
 
     async def create_one(self, account_data: dict) -> bool:
         import aiohttp
@@ -164,15 +136,22 @@ class GmailFactory:
                 return True
 
             except Exception as e:
-                logger.error(f"Worker runtime error: {e}")
+                logger.exception(f"Worker runtime error: {e}")
                 return False
             finally:
-                await ctx.close()
-                await browser.close()
+                try:
+                    await ctx.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     async def _handle_jit_phone_verification(self, page: Page, session) -> bool:
         """
         Procures an SMS number strictly on-demand when the browser reaches the phone challenge DOM.
+        Uses the unified SMSPool client API.
         """
         phone_selectors = "input#phoneNumberId, input[type='tel'], input[name='phoneNumber']"
 
@@ -184,16 +163,23 @@ class GmailFactory:
         except PlaywrightTimeout:
             logger.info("No phone verification required by Google. Skipping SMS purchase entirely.")
             return True
+        except Exception:
+            # selector wait may raise other exceptions; treat as "no phone" to be safe
+            logger.info("Phone input not detected; skipping SMS purchase.")
+            return True
 
         # Step B: Purchase number on-demand now that we know we need it
-        order = await self.smspool.buy_number(session, country=self.cfg.get("smspool_country_id", 8))
-        
+        if not self.smspool:
+            logger.error("No SMSPool client available to buy number")
+            return False
+
+        order = await self.smspool.buy_number(session, country=self.cfg.get("smspool", {}).get("country", 8))
         if not order:
             logger.error("Could not obtain number from SMSPool. Aborting flow.")
             return False
 
-        order_id = order["order_id"]
-        phone_num = order["number"]
+        order_id = order.get("order_id")
+        phone_num = order.get("number")
 
         # Step C: Input phone number and handle OTP polling safely
         try:
@@ -205,10 +191,14 @@ class GmailFactory:
 
             # Check for immediate carrier rejection
             error_selector = "div[type='error'], .o6982b"
-            if await page.is_visible(error_selector):
-                logger.warning(f"Google rejected phone number +{phone_num}. Cancelling order to refund balance...")
-                await self.smspool.cancel_order(session, order_id)
-                return False
+            try:
+                if await page.is_visible(error_selector):
+                    logger.warning(f"Google rejected phone number +{phone_num}. Cancelling order to refund balance...")
+                    await self.smspool.cancel_order(session, order_id)
+                    return False
+            except Exception:
+                # ignore selector checking problems
+                pass
 
             # Wait for OTP input box
             otp_input_selector = "input[name='code'], input#code, input[type='number']"
@@ -216,7 +206,7 @@ class GmailFactory:
 
             # Poll for OTP code
             logger.info(f"Polling SMS code for order {order_id}...")
-            code = await self._poll_smspool_code(session, order_id)
+            code = await self.smspool.poll_sms(session, order_id)
 
             if not code:
                 logger.warning(f"OTP timeout for order {order_id}. Cancelling order...")
@@ -229,26 +219,9 @@ class GmailFactory:
             return True
 
         except Exception as e:
-            logger.error(f"Error inside verification block: {e}")
-            await self.smspool.cancel_order(session, order_id)
-            return False
-
-    async def _poll_smspool_code(self, session, order_id: str, max_retries: int = 24) -> Optional[str]:
-        """Polls SMSPool for the OTP code every 5 seconds (up to 2 minutes total)."""
-        url = "https://api.smspool.net/sms/check"
-        params = {"key": self.smspool.api_key, "orderid": order_id}
-
-        for _ in range(max_retries):
+            logger.exception(f"Error inside verification block: {e}")
             try:
-                async with session.post(url, data=params) as resp:
-                    data = await resp.json(content_type=None)
-                    if data.get("status") == 3:  # Completed / Code Received
-                        return data.get("sms")
-                    elif data.get("status") == 1:  # Pending
-                        await asyncio.sleep(5)
-                    else:
-                        break
+                await self.smspool.cancel_order(session, order_id)
             except Exception:
-                await asyncio.sleep(5)
-
-        return None
+                pass
+            return False

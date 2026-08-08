@@ -1,6 +1,7 @@
 import sqlite3
 import csv
 import logging
+import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ class Storage:
 
     def __init__(self, db_path: str = "accounts.db"):
         self.db_path = db_path
+        self._lock = threading.Lock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._init_tables()
@@ -77,48 +79,52 @@ class Storage:
         self.conn.commit()
 
     def save_account(self, acc: Account) -> bool:
-        try:
-            self.conn.execute(
-                """INSERT OR IGNORE INTO accounts
-                   (email, password, phone, phone_order_id, proxy, status, created_at)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (acc.email, acc.password, acc.phone,
-                 acc.phone_order_id, acc.proxy, acc.status, acc.created_at)
-            )
-            self.conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"save_account error: {e}")
-            return False
+        with self._lock:
+            try:
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO accounts
+                       (email, password, phone, phone_order_id, proxy, status, created_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (acc.email, acc.password, acc.phone,
+                     acc.phone_order_id, acc.proxy, acc.status, acc.created_at)
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"save_account error: {e}")
+                return False
 
     def save_phone(self, phone: PhoneRecord) -> bool:
-        try:
-            self.conn.execute(
-                """INSERT OR IGNORE INTO phone_numbers
-                   (order_id, number, country, uses, active, purchased_at)
-                   VALUES (?,?,?,?,?,?)""",
-                (phone.order_id, phone.number, phone.country,
-                 phone.uses, int(phone.active), datetime.now().isoformat())
-            )
-            self.conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"save_phone error: {e}")
-            return False
+        with self._lock:
+            try:
+                self.conn.execute(
+                    """INSERT OR IGNORE INTO phone_numbers
+                       (order_id, number, country, uses, active, purchased_at)
+                       VALUES (?,?,?,?,?,?)""",
+                    (phone.order_id, phone.number, phone.country,
+                     phone.uses, int(phone.active), datetime.now().isoformat())
+                )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"save_phone error: {e}")
+                return False
 
     def increment_phone_use(self, order_id: str):
-        self.conn.execute(
-            "UPDATE phone_numbers SET uses = uses + 1 WHERE order_id = ?",
-            (order_id,)
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE phone_numbers SET uses = uses + 1 WHERE order_id = ?",
+                (order_id,)
+            )
+            self.conn.commit()
 
     def deactivate_phone(self, order_id: str):
-        self.conn.execute(
-            "UPDATE phone_numbers SET active = 0 WHERE order_id = ?",
-            (order_id,)
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE phone_numbers SET active = 0 WHERE order_id = ?",
+                (order_id,)
+            )
+            self.conn.commit()
 
     def get_reusable_phone(self, max_uses: int) -> Optional[dict]:
         row = self.conn.execute(
@@ -158,16 +164,18 @@ class Storage:
         }
 
     def update_account_status(self, email: str, status: str):
-        self.conn.execute(
-            "UPDATE accounts SET status=? WHERE email=?",
-            (status, email)
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE accounts SET status=? WHERE email=?",
+                (status, email)
+            )
+            self.conn.commit()
 
     def export_csv(self, path: str = "accounts_export.csv"):
         accounts = self.get_all_accounts()
         if not accounts:
             return 0
+        # no lock needed for reading snapshot
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=accounts[0].keys())
             writer.writeheader()
@@ -175,4 +183,7 @@ class Storage:
         return len(accounts)
 
     def close(self):
-        self.conn.close()
+        try:
+            self.conn.close()
+        except Exception:
+            pass
